@@ -1,0 +1,1647 @@
+openapi: 3.1.0
+info:
+  title: Conference Registration API
+  version: 0.1.0
+  summary: Reference API contract for the Conference Registration MVP demo.
+  description: |
+    Behavior is defined by the "Conference Registration App — MVP Spec". Where this
+    contract and the spec disagree on behavior, the spec wins. Requirement ids
+    (FR-x.y, NFR-x, AC-xx) in descriptions refer to that spec.
+
+    ## Conventions
+
+    - Request and response bodies are JSON unless an operation states otherwise.
+    - **Money** is an object holding integer minor units (cents) and an ISO 4217 currency code.
+    - **Timestamps** are RFC 3339 in UTC. Clients display them in `Event.timezone`.
+    - **Errors** use RFC 9457 Problem Details (`application/problem+json`) with a
+      machine-readable `code` (see `ErrorCode`).
+    - **Magic links** have the form `{app.baseUrl}/access/{token}`. The web client reads the
+      token from the URL and sends it to the API in the `X-Access-Token` header. A token is
+      scoped to one order (buyer) or one attendee.
+    - **Admin** endpoints require a bearer token from `POST /admin/session`.
+    - **Paging** is 1-based: `page` (default 1) and `pageSize` (default 25, max 100).
+servers:
+  - url: http://localhost:8080/api
+    description: Local development
+tags:
+  - name: Public
+    description: Event information, ticket availability and pricing.
+  - name: Orders
+    description: Placing an order (registration, group purchase, discount, mock payment).
+  - name: Self-service
+    description: Buyer and attendee access through magic links.
+  - name: Admin
+    description: Attendee management, dashboard, email outbox and audit log.
+  - name: Email delivery
+    description: Used by the external sender to pick up generated emails and report delivery.
+  - name: Test support
+    description: |
+      Clock override and reset (spec section 10, NFR-8). Enabled only when test support
+      is switched on in configuration; otherwise every operation returns 404.
+
+paths:
+  # ---------------------------------------------------------------- Public
+  /event:
+    get:
+      tags: [Public]
+      operationId: getEvent
+      summary: Get event details, registration questions and policies
+      description: FR-1.1. All values come from the properties file.
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+
+  /ticket-types:
+    get:
+      tags: [Public]
+      operationId: listTicketTypes
+      summary: List ticket types with availability
+      description: |
+        FR-1.2, FR-1.3. Availability is computed against the overbooking cap
+        (spec 6.1). Remaining counts are never exposed publicly.
+      responses:
+        '200':
+          description: All configured ticket types.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TicketType' }
+
+  /quotes:
+    post:
+      tags: [Orders]
+      operationId: createQuote
+      summary: Price a cart, optionally with a discount code
+      description: |
+        Used by the review step (FR-2.6) and to validate a discount code (FR-3.1–3.4).
+        Does not reserve tickets or consume discount uses.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteRequest' }
+      responses:
+        '200':
+          description: Priced cart.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+        '409': { $ref: '#/components/responses/SoldOut' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /orders:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Place an order
+      description: |
+        Validates the cart, consents and discount; re-checks availability (FR-2.7);
+        charges the mock card (FR-4.1–4.4); and, on success, creates the order,
+        tickets, confirmation numbers, magic links and emails in one all-or-nothing
+        step (NFR-4).
+
+        Mock card rules: a Luhn-valid number ending in `0002` is declined; any other
+        valid number is approved. `payment` must be omitted when the total is zero and
+        is required otherwise.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Optional client key. Repeating a request with the same key returns the original result.
+          schema: { type: string, maxLength: 100 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrderRequest' }
+      responses:
+        '201':
+          description: Order placed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderConfirmation' }
+        '402':
+          description: Mock payment declined (`payment_declined`). Nothing was created.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409': { $ref: '#/components/responses/SoldOut' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ---------------------------------------------------------------- Self-service
+  /my:
+    get:
+      tags: [Self-service]
+      operationId: getAccessScope
+      summary: Describe what the presented magic-link token gives access to
+      security: [{ magicLink: [] }]
+      responses:
+        '200':
+          description: Token scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccessScope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /my/order:
+    get:
+      tags: [Self-service]
+      operationId: getMyOrder
+      summary: Get the buyer's order with all its attendees
+      description: FR-6.4. Requires an order-scoped token.
+      security: [{ magicLink: [] }]
+      responses:
+        '200':
+          description: The order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /my/order/invoice-details:
+    put:
+      tags: [Self-service]
+      operationId: updateMyInvoiceDetails
+      summary: Replace the order's invoice details
+      description: FR-6.4. Requires an order-scoped token.
+      security: [{ magicLink: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InvoiceDetails' }
+      responses:
+        '200':
+          description: Updated order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /my/order/cancel:
+    post:
+      tags: [Self-service]
+      operationId: cancelMyOrder
+      summary: Cancel every active ticket in the order
+      description: |
+        FR-6.4, spec 6.3. Each ticket gets a mock refund and cancellation emails are
+        generated. Refused after the event starts (`event_started`).
+      security: [{ magicLink: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelRequest' }
+      responses:
+        '200':
+          description: Updated order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /my/order/attendees/{attendeeId}/cancel:
+    post:
+      tags: [Self-service]
+      operationId: cancelTicketInMyOrder
+      summary: Cancel one ticket in the buyer's order
+      description: FR-6.4. Same rules as attendee self-cancellation.
+      security: [{ magicLink: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AttendeeId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelRequest' }
+      responses:
+        '200':
+          description: Updated order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /my/attendee:
+    get:
+      tags: [Self-service]
+      operationId: getMyRegistration
+      summary: Get the attendee's own registration
+      description: FR-6.1. Requires an attendee-scoped token.
+      security: [{ magicLink: [] }]
+      responses:
+        '200':
+          description: The registration.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Attendee' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    patch:
+      tags: [Self-service]
+      operationId: updateMyRegistration
+      summary: Edit the attendee's own details
+      description: FR-6.2. Ticket type cannot be changed. Refused after the event starts (`event_started`).
+      security: [{ magicLink: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AttendeeUpdate' }
+      responses:
+        '200':
+          description: Updated registration.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Attendee' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /my/attendee/cancel:
+    post:
+      tags: [Self-service]
+      operationId: cancelMyRegistration
+      summary: Cancel the attendee's own ticket
+      description: |
+        FR-6.3. Mock refund of the amount paid; seat freed; discount uses not returned;
+        cancellation emails to buyer and attendee (AC-12).
+      security: [{ magicLink: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelRequest' }
+      responses:
+        '200':
+          description: Cancelled registration.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Attendee' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /my/attendee/qr:
+    get:
+      tags: [Self-service]
+      operationId: getMyQrCode
+      summary: Get the ticket's QR code
+      description: FR-5.1. The QR code encodes the confirmation number only.
+      security: [{ magicLink: [] }]
+      responses:
+        '200':
+          description: QR code image.
+          content:
+            image/svg+xml:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /my/attendee/calendar.ics:
+    get:
+      tags: [Self-service]
+      operationId: getMyCalendarFile
+      summary: Download the calendar invite
+      description: FR-9.5.
+      security: [{ magicLink: [] }]
+      responses:
+        '200':
+          description: iCalendar file.
+          content:
+            text/calendar:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /my/receipt:
+    get:
+      tags: [Self-service]
+      operationId: getMyReceipt
+      summary: Get the printable receipt
+      description: |
+        FR-9.4. With an order-scoped token, covers the whole order; with an
+        attendee-scoped token, covers that attendee's ticket.
+      security: [{ magicLink: [] }]
+      responses:
+        '200':
+          description: Printable HTML receipt.
+          content:
+            text/html:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /my/invoice:
+    get:
+      tags: [Self-service]
+      operationId: getMyInvoice
+      summary: Get the printable invoice
+      description: FR-9.4. Requires an order-scoped token.
+      security: [{ magicLink: [] }]
+      responses:
+        '200':
+          description: Printable HTML invoice.
+          content:
+            text/html:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /my/data-export:
+    get:
+      tags: [Self-service]
+      operationId: exportMyData
+      summary: Download the attendee's personal data
+      description: FR-6.5. Requires an attendee-scoped token. Recorded in the audit log.
+      security: [{ magicLink: [] }]
+      responses:
+        '200':
+          description: Personal data export.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PersonalDataExport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /my/data-deletion:
+    post:
+      tags: [Self-service]
+      operationId: deleteMyData
+      summary: Delete the attendee's personal data
+      description: |
+        Spec 6.5, AC-21. An active ticket is cancelled with a mock refund first; personal
+        fields are then cleared and the token is revoked. Cannot be undone.
+      security: [{ magicLink: [] }]
+      responses:
+        '200':
+          description: Data deleted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeletionResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ---------------------------------------------------------------- Admin
+  /admin/session:
+    post:
+      tags: [Admin]
+      operationId: createAdminSession
+      summary: Sign in with the shared admin passcode
+      description: Spec section 3. Sessions expire after 8 hours of inactivity.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminSessionRequest' }
+      responses:
+        '201':
+          description: Session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminSession' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      tags: [Admin]
+      operationId: deleteAdminSession
+      summary: Sign out
+      security: [{ adminAuth: [] }]
+      responses:
+        '204': { description: Signed out. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/attendees:
+    get:
+      tags: [Admin]
+      operationId: listAttendees
+      summary: Search and filter attendees
+      description: FR-7.1.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Search'
+        - $ref: '#/components/parameters/TicketTypeFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/AccommodationsFilter'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/SortDirection'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: A page of attendees.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminAttendeePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Admin]
+      operationId: createAttendeeAsAdmin
+      summary: Add an attendee manually (paid offline or comp)
+      description: |
+        FR-7.4, AC-16, AC-17. Creates a single-ticket order. If `buyer` is omitted, the
+        attendee is the buyer. Comps require `compReason`. Exceeding the ticket cap
+        requires `overrideCap: true`, which is recorded in the audit log.
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminCreateAttendeeRequest' }
+      responses:
+        '201':
+          description: Attendee created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminAttendeeDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /admin/attendees/export:
+    get:
+      tags: [Admin]
+      operationId: exportAttendees
+      summary: Export the filtered attendee list as CSV
+      description: |
+        FR-7.2, AC-19. Accepts the same filters as `listAttendees` (no paging). Columns:
+        order number, confirmation number, ticket type, first name, last name, email,
+        status, source, price paid, registered at, accommodations
+        requested, then one column per configured question in configuration order.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Search'
+        - $ref: '#/components/parameters/TicketTypeFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/AccommodationsFilter'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/SortDirection'
+      responses:
+        '200':
+          description: CSV file with a header row.
+          content:
+            text/csv:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/attendees/{attendeeId}:
+    get:
+      tags: [Admin]
+      operationId: getAttendeeAsAdmin
+      summary: Get full attendee details, payment and audit history
+      description: FR-7.3.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AttendeeId'
+      responses:
+        '200':
+          description: Attendee detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminAttendeeDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Admin]
+      operationId: updateAttendeeAsAdmin
+      summary: Edit an attendee's details
+      description: Allowed after the event starts (spec 6.3).
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AttendeeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AttendeeUpdate' }
+      responses:
+        '200':
+          description: Updated attendee.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminAttendeeDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /admin/attendees/{attendeeId}/cancel:
+    post:
+      tags: [Admin]
+      operationId: cancelAttendeeAsAdmin
+      summary: Cancel a ticket with a mock refund
+      description: FR-7.5. Returns 409 `ticket_cancelled` if the ticket is already cancelled.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AttendeeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminCancelRequest' }
+      responses:
+        '200':
+          description: Cancelled attendee.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminAttendeeDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /admin/attendees/{attendeeId}/regenerate-link:
+    post:
+      tags: [Admin]
+      operationId: regenerateAttendeeLink
+      summary: Reissue the ticket email with a new magic link
+      description: FR-7.6, AC-18. The previous attendee link is revoked.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AttendeeId'
+      responses:
+        '200':
+          description: New link issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegenerateLinkResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/orders/{orderId}:
+    get:
+      tags: [Admin]
+      operationId: getOrderAsAdmin
+      summary: Get an order with payment, refunds and consents
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: The order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminOrder' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/orders/{orderId}/cancel:
+    post:
+      tags: [Admin]
+      operationId: cancelOrderAsAdmin
+      summary: Cancel every active ticket in an order
+      description: FR-7.5.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminCancelRequest' }
+      responses:
+        '200':
+          description: Updated order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminOrder' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /admin/orders/{orderId}/regenerate-link:
+    post:
+      tags: [Admin]
+      operationId: regenerateOrderLink
+      summary: Reissue the order confirmation with a new buyer magic link
+      description: FR-7.6. The previous buyer link is revoked.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: New link issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegenerateLinkResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/dashboard:
+    get:
+      tags: [Admin]
+      operationId: getDashboard
+      summary: Get sales and revenue totals
+      description: FR-7.7, AC-24.
+      security: [{ adminAuth: [] }]
+      responses:
+        '200':
+          description: Dashboard figures.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/emails:
+    get:
+      tags: [Admin]
+      operationId: listEmails
+      summary: List generated emails (outbox)
+      description: FR-7.8. Newest first.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/EmailType' }
+        - name: recipient
+          in: query
+          description: Exact recipient email address.
+          schema: { type: string, format: email }
+        - name: deliveryStatus
+          in: query
+          schema: { $ref: '#/components/schemas/DeliveryStatus' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: A page of emails.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmailPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/emails/{emailId}:
+    get:
+      tags: [Admin]
+      operationId: getEmail
+      summary: Get one email with its text and HTML bodies
+      description: FR-7.8, FR-9.1.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/EmailId'
+      responses:
+        '200':
+          description: The email.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmailMessage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/reminders:
+    post:
+      tags: [Admin]
+      operationId: generateReminders
+      summary: Generate reminder emails
+      description: |
+        FR-9.3, AC-23. Generates one reminder for each active attendee who has not had one.
+        Safe to call repeatedly.
+      security: [{ adminAuth: [] }]
+      responses:
+        '200':
+          description: Number of reminders generated by this call.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReminderResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/audit-log:
+    get:
+      tags: [Admin]
+      operationId: listAuditEntries
+      summary: List audit log entries
+      description: FR-7.9, NFR-5. Newest first. Entries are read-only.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: attendeeId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: orderId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: action
+          in: query
+          schema: { $ref: '#/components/schemas/AuditAction' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: A page of audit entries.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------------------------------------------------------- Email delivery
+  /delivery/emails:
+    get:
+      tags: [Email delivery]
+      operationId: listEmailsForDelivery
+      summary: List emails waiting for delivery
+      description: FR-9.1. Oldest first, so the sender works through them in order.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: deliveryStatus
+          in: query
+          schema:
+            $ref: '#/components/schemas/DeliveryStatus'
+            default: pending
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: A page of emails with bodies.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmailMessagePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /delivery/emails/{emailId}:
+    patch:
+      tags: [Email delivery]
+      operationId: updateDeliveryStatus
+      summary: Report the delivery result for an email
+      description: FR-9.1.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/EmailId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeliveryStatusUpdate' }
+      responses:
+        '200':
+          description: Updated email.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmailMessage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ---------------------------------------------------------------- Test support
+  /test/clock:
+    get:
+      tags: [Test support]
+      operationId: getClock
+      summary: Get the app's current time
+      responses:
+        '200':
+          description: Current time and whether it is overridden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClockState' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Test support]
+      operationId: setClock
+      summary: Override the app's current time
+      description: Used by AC-11 and AC-13. Does not change the system clock.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClockOverride' }
+      responses:
+        '200':
+          description: Clock overridden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClockState' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Test support]
+      operationId: clearClock
+      summary: Return to the real clock
+      responses:
+        '204': { description: Override cleared. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /test/reset:
+    post:
+      tags: [Test support]
+      operationId: resetData
+      summary: Reset to an empty database with the sample configuration
+      description: NFR-8. Also clears any clock override.
+      responses:
+        '204': { description: Reset complete. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    adminAuth:
+      type: http
+      scheme: bearer
+      description: Token from `POST /admin/session`. Used by admin and email-delivery endpoints.
+    magicLink:
+      type: apiKey
+      in: header
+      name: X-Access-Token
+      description: The token from a magic link, scoped to one order or one attendee.
+
+  parameters:
+    AttendeeId:
+      name: attendeeId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    EmailId:
+      name: emailId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Search:
+      name: q
+      in: query
+      description: Matches name, email, confirmation number or order number.
+      schema: { type: string }
+    TicketTypeFilter:
+      name: ticketTypeId
+      in: query
+      schema: { type: string }
+    StatusFilter:
+      name: status
+      in: query
+      schema: { $ref: '#/components/schemas/AttendeeStatus' }
+    AccommodationsFilter:
+      name: accommodationsRequested
+      in: query
+      schema: { type: boolean }
+    Sort:
+      name: sort
+      in: query
+      schema:
+        type: string
+        enum: [name, registeredAt]
+        default: registeredAt
+    SortDirection:
+      name: direction
+      in: query
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+
+  responses:
+    Unauthorized:
+      description: Missing, invalid, expired or revoked credentials (`unauthorized`, `link_revoked`).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: The token's scope does not allow this operation (`forbidden`).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Resource not found, or outside the caller's scope (`not_found`).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    SoldOut:
+      description: |
+        A ticket type has too few tickets left (`sold_out`). `ticketTypeId` and
+        `remaining` say which type and how many are left (FR-2.7, AC-05).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: |
+        The request conflicts with current state, e.g. `event_started`, `ticket_cancelled`,
+        `cap_exceeded`.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationFailed:
+      description: |
+        The request is invalid (`validation_failed` with `errors`), or breaks a business
+        rule such as `duplicate_attendee_email`, `consent_required`, `order_too_large`,
+        `ticket_type_not_on_sale` or a `discount_*` code.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    # ------------------------------------------------------------ Errors
+    ErrorCode:
+      type: string
+      enum:
+        - validation_failed
+        - unauthorized
+        - forbidden
+        - not_found
+        - link_revoked
+        - duplicate_attendee_email
+        - consent_required
+        - order_too_large
+        - ticket_type_not_on_sale
+        - sold_out
+        - discount_invalid
+        - discount_expired
+        - discount_exhausted
+        - discount_insufficient_uses
+        - discount_not_applicable
+        - payment_required
+        - payment_not_allowed
+        - payment_declined
+        - event_started
+        - ticket_cancelled
+        - cap_exceeded
+        - comp_reason_required
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details with extension members.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri-reference, example: 'https://errors.example.com/sold-out' }
+        title: { type: string, example: Not enough tickets left }
+        status: { type: integer, example: 409 }
+        detail: { type: string, example: Only 1 Student ticket remains. }
+        instance: { type: string, format: uri-reference }
+        code: { $ref: '#/components/schemas/ErrorCode' }
+        errors:
+          type: array
+          description: Field-level errors for `validation_failed`.
+          items: { $ref: '#/components/schemas/FieldError' }
+        ticketTypeId:
+          type: string
+          description: Present for `sold_out`, `ticket_type_not_on_sale`, `cap_exceeded`.
+        remaining:
+          type: integer
+          minimum: 0
+          description: Present for `sold_out`. Tickets still available for `ticketTypeId`.
+        usesLeft:
+          type: integer
+          minimum: 0
+          description: Present for `discount_insufficient_uses`.
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: JSON Pointer to the offending field.
+          example: /attendees/1/email
+        message: { type: string, example: Email is already used by another ticket in this order. }
+
+    # ------------------------------------------------------------ Shared values
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: integer
+          description: Integer minor units (e.g. cents).
+          example: 49900
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          example: USD
+    ConfirmationNumber:
+      type: string
+      description: 8 characters from an alphabet without ambiguous characters (no 0, O, 1, I).
+      pattern: '^[2-9A-HJ-NP-Z]{8}$'
+      example: K7QX4MPZ
+    AttendeeStatus:
+      type: string
+      enum: [confirmed, cancelled]
+    OrderStatus:
+      type: string
+      enum: [paid, partially_cancelled, cancelled]
+    AttendeeSource:
+      type: string
+      enum: [public, paid_offline, comp]
+    Answers:
+      type: object
+      description: Answers keyed by configured question id. Text and select answers are strings; checkbox answers are booleans.
+      additionalProperties:
+        type: [string, boolean]
+      example: { company: Acme, shirt: M, diet: Vegetarian }
+    PageMeta:
+      type: object
+      required: [page, pageSize, totalItems, totalPages]
+      properties:
+        page: { type: integer, minimum: 1 }
+        pageSize: { type: integer, minimum: 1 }
+        totalItems: { type: integer, minimum: 0 }
+        totalPages: { type: integer, minimum: 0 }
+    Actor:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [public, buyer, attendee, admin, system]
+        id:
+          type: [string, 'null']
+          description: Order or attendee id for buyer/attendee actors.
+
+    # ------------------------------------------------------------ Event and tickets
+    Event:
+      type: object
+      required: [name, startsAt, endsAt, timezone, organizer, currency, maxTicketsPerOrder, questions, policies]
+      properties:
+        name: { type: string, example: DevConf 2027 }
+        description: { type: string }
+        startsAt: { type: string, format: date-time, example: '2027-04-14T14:00:00Z' }
+        endsAt: { type: string, format: date-time, example: '2027-04-15T22:00:00Z' }
+        timezone: { type: string, description: IANA timezone, example: America/Chicago }
+        venue:
+          type: [object, 'null']
+          required: [name, address]
+          properties:
+            name: { type: string, example: Austin Convention Center }
+            address: { type: string, example: '500 E Cesar Chavez St, Austin, TX' }
+        virtualUrl: { type: [string, 'null'], format: uri }
+        organizer:
+          type: object
+          required: [name, email]
+          properties:
+            name: { type: string }
+            email: { type: string, format: email }
+        bannerImageUrl: { type: [string, 'null'], format: uri-reference }
+        currency: { type: string, pattern: '^[A-Z]{3}$', example: USD }
+        maxTicketsPerOrder: { type: integer, example: 10 }
+        questions:
+          type: array
+          items: { $ref: '#/components/schemas/Question' }
+        policies:
+          type: array
+          items: { $ref: '#/components/schemas/Policy' }
+    Question:
+      type: object
+      required: [id, label, type, required]
+      properties:
+        id: { type: string, example: shirt }
+        label: { type: string, example: T-shirt size }
+        type:
+          type: string
+          enum: [text, select, checkbox]
+        required: { type: boolean }
+        options:
+          type: array
+          description: Present for `select` questions.
+          items: { type: string }
+          example: [XS, S, M, L, XL, XXL]
+    Policy:
+      type: object
+      required: [type, version, url]
+      properties:
+        type:
+          type: string
+          enum: [code_of_conduct, privacy]
+        version: { type: string, example: '2026-11-01' }
+        url: { type: string, format: uri }
+        text: { type: string }
+    TicketType:
+      type: object
+      required: [id, name, price, saleStartsAt, saleEndsAt, availability]
+      properties:
+        id: { type: string, example: general }
+        name: { type: string, example: General Admission }
+        description: { type: string }
+        price: { $ref: '#/components/schemas/Money' }
+        saleStartsAt: { type: string, format: date-time }
+        saleEndsAt: { type: string, format: date-time }
+        availability:
+          type: string
+          enum: [available, not_on_sale_yet, sale_ended, sold_out]
+
+    # ------------------------------------------------------------ Quotes and orders
+    LineItemRequest:
+      type: object
+      required: [ticketTypeId, quantity]
+      properties:
+        ticketTypeId: { type: string }
+        quantity: { type: integer, minimum: 1 }
+    QuoteRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/LineItemRequest' }
+        discountCode: { type: [string, 'null'], example: SAVE20 }
+    QuoteLine:
+      type: object
+      required: [ticketTypeId, ticketTypeName, quantity, unitPrice, discountPerTicket, lineTotal]
+      properties:
+        ticketTypeId: { type: string }
+        ticketTypeName: { type: string }
+        quantity: { type: integer }
+        unitPrice: { $ref: '#/components/schemas/Money' }
+        discountPerTicket: { $ref: '#/components/schemas/Money' }
+        lineTotal: { $ref: '#/components/schemas/Money' }
+    Quote:
+      type: object
+      required: [lines, subtotal, discount, total, paymentRequired]
+      properties:
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/QuoteLine' }
+        discountCode: { type: [string, 'null'] }
+        subtotal: { $ref: '#/components/schemas/Money' }
+        discount: { $ref: '#/components/schemas/Money' }
+        total: { $ref: '#/components/schemas/Money' }
+        paymentRequired:
+          type: boolean
+          description: False when the total is zero (FR-4.4).
+    BuyerInput:
+      type: object
+      required: [name, email]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        email: { type: string, format: email }
+    InvoiceDetails:
+      type: object
+      properties:
+        companyName: { type: [string, 'null'], maxLength: 200 }
+        billingAddress: { type: [string, 'null'], maxLength: 500 }
+        poNumber: { type: [string, 'null'], maxLength: 100 }
+    AttendeeInput:
+      type: object
+      required: [ticketTypeId, firstName, lastName, email, accommodationsRequested]
+      properties:
+        ticketTypeId: { type: string }
+        firstName: { type: string, minLength: 1, maxLength: 100 }
+        lastName: { type: string, minLength: 1, maxLength: 100 }
+        email: { type: string, format: email }
+        answers: { $ref: '#/components/schemas/Answers' }
+        accommodationsRequested:
+          type: boolean
+          description: '"I need special accommodations to attend" (FR-2.3).'
+    ConsentInput:
+      type: object
+      required: [type, version, accepted]
+      properties:
+        type:
+          type: string
+          enum: [code_of_conduct, privacy]
+        version: { type: string }
+        accepted: { const: true }
+    CardInput:
+      type: object
+      writeOnly: true
+      description: Mock card. Never stored or logged except the last four digits (FR-4.3).
+      required: [cardholderName, number, expMonth, expYear, cvc]
+      properties:
+        cardholderName: { type: string, minLength: 1 }
+        number:
+          type: string
+          pattern: '^[0-9]{12,19}$'
+          description: Digits only; must pass the Luhn check. Ending in 0002 is declined.
+          example: '4242424242424242'
+        expMonth: { type: integer, minimum: 1, maximum: 12 }
+        expYear: { type: integer, minimum: 2000 }
+        cvc: { type: string, pattern: '^[0-9]{3,4}$' }
+    CreateOrderRequest:
+      type: object
+      required: [buyer, attendees, consents]
+      description: |
+        Attendee count per ticket type defines the quantities. Total tickets must not
+        exceed `Event.maxTicketsPerOrder`. Attendee emails must be unique within the order.
+        Both policies must be accepted at their current versions.
+      properties:
+        buyer: { $ref: '#/components/schemas/BuyerInput' }
+        invoiceDetails: { $ref: '#/components/schemas/InvoiceDetails' }
+        attendees:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/AttendeeInput' }
+        discountCode: { type: [string, 'null'] }
+        consents:
+          type: array
+          minItems: 2
+          items: { $ref: '#/components/schemas/ConsentInput' }
+        payment: { $ref: '#/components/schemas/CardInput' }
+    PaymentSummary:
+      type: object
+      required: [method, amount, result, at]
+      properties:
+        method:
+          type: string
+          enum: [card, paid_offline, comp, none]
+        cardLast4: { type: [string, 'null'], pattern: '^[0-9]{4}$' }
+        transactionId: { type: [string, 'null'], description: Mock transaction id. }
+        amount: { $ref: '#/components/schemas/Money' }
+        result:
+          type: string
+          enum: [approved]
+        at: { type: string, format: date-time }
+    Refund:
+      type: object
+      required: [id, attendeeId, amount, reason, mockRefundId, at, triggeredBy]
+      properties:
+        id: { type: string, format: uuid }
+        attendeeId: { type: string, format: uuid }
+        amount: { $ref: '#/components/schemas/Money' }
+        reason: { type: string }
+        mockRefundId: { type: string }
+        at: { type: string, format: date-time }
+        triggeredBy: { $ref: '#/components/schemas/Actor' }
+    Attendee:
+      type: object
+      required: [id, confirmationNumber, ticketTypeId, ticketTypeName, firstName, lastName, email, answers, accommodationsRequested, status, pricePaid]
+      properties:
+        id: { type: string, format: uuid }
+        confirmationNumber: { $ref: '#/components/schemas/ConfirmationNumber' }
+        ticketTypeId: { type: string }
+        ticketTypeName: { type: string }
+        firstName: { type: string }
+        lastName: { type: string }
+        email: { type: [string, 'null'], format: email, description: Null after data deletion. }
+        answers: { $ref: '#/components/schemas/Answers' }
+        accommodationsRequested: { type: boolean }
+        status: { $ref: '#/components/schemas/AttendeeStatus' }
+        pricePaid: { $ref: '#/components/schemas/Money' }
+        cancelledAt: { type: [string, 'null'], format: date-time }
+    AttendeeUpdate:
+      type: object
+      minProperties: 1
+      description: Partial update. Omitted fields are unchanged.
+      properties:
+        firstName: { type: string, minLength: 1, maxLength: 100 }
+        lastName: { type: string, minLength: 1, maxLength: 100 }
+        email: { type: string, format: email }
+        answers: { $ref: '#/components/schemas/Answers' }
+        accommodationsRequested: { type: boolean }
+    Order:
+      type: object
+      required: [id, orderNumber, status, buyer, invoiceDetails, subtotal, discount, total, refunded, attendees, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        orderNumber: { type: string, example: ORD-000123 }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        buyer: { $ref: '#/components/schemas/BuyerInput' }
+        invoiceDetails: { $ref: '#/components/schemas/InvoiceDetails' }
+        discountCode: { type: [string, 'null'] }
+        subtotal: { $ref: '#/components/schemas/Money' }
+        discount: { $ref: '#/components/schemas/Money' }
+        total: { $ref: '#/components/schemas/Money' }
+        refunded: { $ref: '#/components/schemas/Money' }
+        payment:
+          oneOf:
+            - $ref: '#/components/schemas/PaymentSummary'
+            - type: 'null'
+        attendees:
+          type: array
+          items: { $ref: '#/components/schemas/Attendee' }
+        createdAt: { type: string, format: date-time }
+    OrderConfirmation:
+      type: object
+      required: [order, buyerAccessUrl, receiptUrl, invoiceUrl]
+      description: FR-5.2. Attendee magic links are delivered only in ticket emails.
+      properties:
+        order: { $ref: '#/components/schemas/Order' }
+        buyerAccessUrl:
+          type: string
+          format: uri
+          example: 'http://localhost:8080/access/3q2-example-token'
+        receiptUrl: { type: string, format: uri-reference }
+        invoiceUrl: { type: string, format: uri-reference }
+
+    # ------------------------------------------------------------ Self-service
+    AccessScope:
+      type: object
+      required: [scope, orderNumber, expiresAt]
+      properties:
+        scope:
+          type: string
+          enum: [order, attendee]
+        orderNumber: { type: string }
+        confirmationNumber:
+          oneOf:
+            - $ref: '#/components/schemas/ConfirmationNumber'
+            - type: 'null'
+        expiresAt: { type: string, format: date-time }
+        editableUntil:
+          type: string
+          format: date-time
+          description: Event start; self-service edits and cancellations close then.
+    CancelRequest:
+      type: object
+      properties:
+        reason: { type: string, maxLength: 500 }
+    PersonalDataExport:
+      type: object
+      required: [exportedAt, attendee, order, consents, emails]
+      properties:
+        exportedAt: { type: string, format: date-time }
+        attendee: { $ref: '#/components/schemas/Attendee' }
+        order:
+          type: object
+          required: [orderNumber, buyer]
+          properties:
+            orderNumber: { type: string }
+            buyer: { $ref: '#/components/schemas/BuyerInput' }
+        consents:
+          type: array
+          items: { $ref: '#/components/schemas/ConsentRecord' }
+        emails:
+          type: array
+          items: { $ref: '#/components/schemas/EmailSummary' }
+    ConsentRecord:
+      type: object
+      required: [type, version, acceptedAt]
+      properties:
+        type:
+          type: string
+          enum: [code_of_conduct, privacy]
+        version: { type: string }
+        acceptedAt: { type: string, format: date-time }
+    DeletionResult:
+      type: object
+      required: [attendeeId, ticketCancelled]
+      properties:
+        attendeeId: { type: string, format: uuid }
+        ticketCancelled:
+          type: boolean
+          description: True if an active ticket was cancelled as part of deletion.
+        refund:
+          oneOf:
+            - $ref: '#/components/schemas/Refund'
+            - type: 'null'
+
+    # ------------------------------------------------------------ Admin
+    AdminSessionRequest:
+      type: object
+      required: [passcode]
+      properties:
+        passcode: { type: string, writeOnly: true }
+    AdminSession:
+      type: object
+      required: [token, expiresAt]
+      properties:
+        token: { type: string }
+        expiresAt:
+          type: string
+          format: date-time
+          description: Extended on each authenticated request (8 hours of inactivity).
+    AdminAttendee:
+      allOf:
+        - $ref: '#/components/schemas/Attendee'
+        - type: object
+          required: [orderId, orderNumber, source, registeredAt]
+          properties:
+            orderId: { type: string, format: uuid }
+            orderNumber: { type: string }
+            source: { $ref: '#/components/schemas/AttendeeSource' }
+            compReason: { type: [string, 'null'] }
+            registeredAt: { type: string, format: date-time }
+    AdminAttendeeDetail:
+      allOf:
+        - $ref: '#/components/schemas/AdminAttendee'
+        - type: object
+          required: [buyer, refunds, auditLog]
+          properties:
+            buyer: { $ref: '#/components/schemas/BuyerInput' }
+            payment:
+              oneOf:
+                - $ref: '#/components/schemas/PaymentSummary'
+                - type: 'null'
+            refunds:
+              type: array
+              items: { $ref: '#/components/schemas/Refund' }
+            auditLog:
+              type: array
+              items: { $ref: '#/components/schemas/AuditEntry' }
+    AdminAttendeePage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/AdminAttendee' }
+    AdminOrder:
+      allOf:
+        - $ref: '#/components/schemas/Order'
+        - type: object
+          required: [refunds, consents]
+          properties:
+            refunds:
+              type: array
+              items: { $ref: '#/components/schemas/Refund' }
+            consents:
+              type: array
+              items: { $ref: '#/components/schemas/ConsentRecord' }
+    AdminCreateAttendeeRequest:
+      type: object
+      required: [attendee, source]
+      properties:
+        attendee: { $ref: '#/components/schemas/AttendeeInput' }
+        source:
+          type: string
+          enum: [paid_offline, comp]
+        compReason:
+          type: [string, 'null']
+          minLength: 1
+          description: Required when `source` is `comp` (`comp_reason_required`).
+        buyer: { $ref: '#/components/schemas/BuyerInput' }
+        invoiceDetails: { $ref: '#/components/schemas/InvoiceDetails' }
+        overrideCap:
+          type: boolean
+          default: false
+          description: Allow selling past the ticket type's cap (spec 6.1). Without it, a full type returns 409 `cap_exceeded`.
+    AdminCancelRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 500 }
+    RegenerateLinkResult:
+      type: object
+      required: [emailId, accessUrl, previousLinkRevoked]
+      properties:
+        emailId: { type: string, format: uuid }
+        accessUrl: { type: string, format: uri }
+        previousLinkRevoked: { type: boolean, const: true }
+    Dashboard:
+      type: object
+      required: [generatedAt, ticketTypes, revenue, accommodationRequestCount, discountCodes]
+      properties:
+        generatedAt: { type: string, format: date-time }
+        ticketTypes:
+          type: array
+          items:
+            type: object
+            required: [ticketTypeId, name, baselineCapacity, cap, sold]
+            properties:
+              ticketTypeId: { type: string }
+              name: { type: string }
+              baselineCapacity: { type: integer, example: 400 }
+              cap: { type: integer, example: 440 }
+              sold:
+                type: integer
+                description: Confirmed (not cancelled) tickets.
+        revenue:
+          type: object
+          required: [gross, discounts, refunds, net]
+          properties:
+            gross: { $ref: '#/components/schemas/Money' }
+            discounts: { $ref: '#/components/schemas/Money' }
+            refunds: { $ref: '#/components/schemas/Money' }
+            net: { $ref: '#/components/schemas/Money' }
+        accommodationRequestCount:
+          type: integer
+          description: Active (not cancelled) attendees who requested accommodations.
+        discountCodes:
+          type: array
+          items:
+            type: object
+            required: [code, usageLimit, used, remaining]
+            properties:
+              code: { type: string }
+              usageLimit: { type: integer }
+              used: { type: integer }
+              remaining: { type: integer }
+    ReminderResult:
+      type: object
+      required: [generated]
+      properties:
+        generated: { type: integer, minimum: 0 }
+
+    # ------------------------------------------------------------ Email
+    EmailType:
+      type: string
+      enum: [order_confirmation, ticket, receipt, cancellation, reminder]
+    DeliveryStatus:
+      type: string
+      enum: [pending, sent, failed]
+    EmailSummary:
+      type: object
+      required: [id, type, recipient, subject, deliveryStatus, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/EmailType' }
+        recipient: { type: [string, 'null'], format: email, description: Null after data deletion. }
+        subject: { type: string }
+        deliveryStatus: { $ref: '#/components/schemas/DeliveryStatus' }
+        orderId: { type: [string, 'null'], format: uuid }
+        attendeeId: { type: [string, 'null'], format: uuid }
+        createdAt: { type: string, format: date-time }
+    EmailMessage:
+      allOf:
+        - $ref: '#/components/schemas/EmailSummary'
+        - type: object
+          required: [textBody, htmlBody]
+          properties:
+            textBody: { type: [string, 'null'], description: Null after data deletion (spec 6.5). }
+            htmlBody: { type: [string, 'null'], description: Null after data deletion (spec 6.5). }
+            accessUrl:
+              type: [string, 'null']
+              format: uri
+              description: The magic link included in this email, if any (order confirmation and ticket emails).
+            deliveryDetail: { type: [string, 'null'] }
+            deliveryUpdatedAt: { type: [string, 'null'], format: date-time }
+    EmailPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/EmailSummary' }
+    EmailMessagePage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/EmailMessage' }
+    DeliveryStatusUpdate:
+      type: object
+      required: [deliveryStatus]
+      properties:
+        deliveryStatus:
+          type: string
+          enum: [sent, failed]
+        detail: { type: string, maxLength: 1000 }
+
+    # ------------------------------------------------------------ Audit
+    AuditAction:
+      type: string
+      enum:
+        - order_placed
+        - attendee_created
+        - attendee_updated
+        - invoice_details_updated
+        - attendee_cancelled
+        - order_cancelled
+        - refund_issued
+        - cap_override
+        - link_regenerated
+        - data_exported
+        - data_deleted
+        - reminders_generated
+        - email_delivery_updated
+    AuditEntry:
+      type: object
+      required: [id, at, actor, action, targetType, targetId]
+      properties:
+        id: { type: string, format: uuid }
+        at: { type: string, format: date-time }
+        actor: { $ref: '#/components/schemas/Actor' }
+        action: { $ref: '#/components/schemas/AuditAction' }
+        targetType:
+          type: string
+          enum: [order, attendee, email, magic_link]
+        targetId: { type: string }
+        before:
+          type: [object, 'null']
+          description: Changed fields before the action. Personal details are replaced by the internal id after deletion.
+        after:
+          type: [object, 'null']
+          description: Changed fields after the action.
+    AuditPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/AuditEntry' }
+
+    # ------------------------------------------------------------ Test support
+    ClockState:
+      type: object
+      required: [now, overridden]
+      properties:
+        now: { type: string, format: date-time }
+        overridden: { type: boolean }
+    ClockOverride:
+      type: object
+      required: [now]
+      properties:
+        now: { type: string, format: date-time, example: '2027-02-01T12:00:00Z' }
