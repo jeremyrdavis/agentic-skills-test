@@ -1,0 +1,505 @@
+openapi: 3.1.0
+info:
+  title: Conference Registration API - v1 (Buy a ticket)
+  version: 0.1.0-v1
+  summary: The four operations of the v1 release, derived from openapi.yaml.
+  description: |
+    The v1 slice of the Conference Registration MVP, as planned in
+    `implementation-plan-v1.md` and section 11 of the spec. Where this contract and the
+    spec disagree on behavior, the spec wins. Requirement ids (FR-x.y, NFR-x, AC-xx) refer
+    to the spec.
+
+    This is a narrowing of `openapi.yaml`, not an extension. Every request that is valid
+    here is valid against `openapi.yaml`, and every response here satisfies the response
+    schemas there, except that `buyerAccessUrl` is absent from `OrderConfirmation`
+    (section 11 permits this until magic links arrive in v2).
+
+    ## Conventions
+
+    - Request and response bodies are JSON unless an operation states otherwise.
+    - **Money** is an object holding integer minor units (cents) and an ISO 4217 currency code.
+    - **Timestamps** are RFC 3339 in UTC. Clients display them in `Event.timezone`.
+    - **Errors** use RFC 9457 Problem Details (`application/problem+json`) with a
+      machine-readable `code` (see `ErrorCode`).
+
+    ## What v1 does not do
+
+    v1 has no magic links, quotes, discounts, email, QR images, cancellation, refunds,
+    admin, audit log or data deletion, and no sale-window, consent, question-answer,
+    invoice-detail, card-expiry or CVC-format enforcement. Those arrive in v2 to v5.
+
+    Fields that exist only for later versions are **accepted and ignored** in requests, and
+    take fixed default values in responses. Each schema below says which.
+servers:
+  - url: http://localhost:8080/api
+    description: Local development
+tags:
+  - name: Public
+    description: Event information and ticket availability.
+  - name: Orders
+    description: Placing an order (group purchase with mock payment).
+  - name: Test support
+    description: |
+      Reset (spec section 10, NFR-8). Enabled only when test support is switched on in
+      configuration, which is off by default; otherwise the operation returns 404.
+
+paths:
+  /event:
+    get:
+      tags: [Public]
+      operationId: getEvent
+      summary: Get event details, registration questions and policies
+      description: |
+        FR-1.1. Values come from the properties file. Configured local date-times are
+        converted to UTC using the configured IANA timezone. Questions and policies are
+        returned as configured even though v1 does not enforce answers or consent.
+        Settings the sample configuration leaves out (organizer details, policy URLs and
+        versions) are filled with documented demo values.
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+
+  /ticket-types:
+    get:
+      tags: [Public]
+      operationId: listTicketTypes
+      summary: List ticket types with availability
+      description: |
+        FR-1.2, FR-1.3. Availability is computed against the overbooking cap (spec 6.1).
+        Remaining counts are never exposed. Sale dates are returned as data but are **not
+        enforced** in v1: availability is only `available` or `sold_out`.
+      responses:
+        '200':
+          description: All configured ticket types.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TicketType' }
+
+  /orders:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Place an order
+      description: |
+        Validates the cart, prices it on the server, re-checks capacity atomically
+        (FR-2.7), charges the mock card (FR-4.1 to FR-4.3) and, on success, creates the
+        paid order and its confirmed tickets in one all-or-nothing step (NFR-4).
+
+        **Validation in v1.** The server refuses (422) a missing or malformed buyer or
+        attendee identity, an empty attendee list, an unknown ticket type, more tickets
+        than `Event.maxTicketsPerOrder`, duplicate attendee emails within the order, a
+        missing `payment` (the sample prices are all positive, so payment is always
+        required) and a card number that is malformed or fails the Luhn check.
+
+        **Accepted and ignored in v1.** `consents`, `invoiceDetails`, attendee `answers`,
+        attendee `accommodationsRequested`, `discountCode`, and the card's
+        `cardholderName`, `expMonth`, `expYear` and `cvc`. They are not validated, stored
+        or applied. A discount code in particular does not change any price and consumes
+        no use. Card expiry freshness and CVC format are not checked.
+
+        **Mock card.** A Luhn-valid number ending in `0002` is declined (402) and creates
+        nothing. Any other valid number is approved. Only the last four digits are kept
+        (FR-4.3); the card number and CVC never appear in a response.
+
+        **Idempotency.** Repeating a request that already succeeded with the same
+        `Idempotency-Key` returns the original confirmation (201) without another sale or
+        payment. Simultaneous requests with the same key are serialized. Failed requests
+        are not remembered, so they can be retried with the same key.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Optional client key, at most 100 characters.
+          schema: { type: string, maxLength: 100 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrderRequest' }
+            examples:
+              approved:
+                summary: One General ticket, approved card
+                value:
+                  buyer: { name: Pat Buyer, email: pat.buyer@example.com }
+                  attendees:
+                    - ticketTypeId: general
+                      firstName: Pat
+                      lastName: Buyer
+                      email: pat.buyer@example.com
+                  payment:
+                    cardholderName: Pat Buyer
+                    number: '4242424242424242'
+                    expMonth: 12
+                    expYear: 2035
+                    cvc: '123'
+              declined:
+                summary: Card ending 0002 is declined
+                value:
+                  buyer: { name: Pat Buyer, email: pat.buyer@example.com }
+                  attendees:
+                    - ticketTypeId: student
+                      firstName: Sam
+                      lastName: Student
+                      email: sam.student@example.com
+                  payment:
+                    number: '4000000000000002'
+      responses:
+        '201':
+          description: Order placed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderConfirmation' }
+        '402':
+          description: Mock payment declined (`payment_declined`). Nothing was created.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: |
+            A ticket type has too few tickets left (`sold_out`). `ticketTypeId` and
+            `remaining` say which type and how many are left (FR-2.7, AC-05). No ticket in
+            the order is sold, including tickets of other types in the same order.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: |
+            The request is invalid (`validation_failed` with `errors`), or breaks a v1
+            business rule: `duplicate_attendee_email`, `order_too_large` or
+            `payment_required`. Nothing was created.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /test/reset:
+    post:
+      tags: [Test support]
+      operationId: resetData
+      summary: Reset to an empty database with the sample configuration
+      description: |
+        NFR-8. Removes all orders, tickets, payment records, sales counts and idempotency
+        state. Repeated resets are harmless.
+      responses:
+        '204': { description: Reset complete. }
+        '404':
+          description: Test support is not enabled (`not_found`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  schemas:
+    # ------------------------------------------------------------ Errors
+    ErrorCode:
+      type: string
+      enum:
+        - validation_failed
+        - duplicate_attendee_email
+        - order_too_large
+        - sold_out
+        - payment_required
+        - payment_declined
+        - not_found
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details with extension members.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri-reference, example: 'https://errors.example.com/sold-out' }
+        title: { type: string, example: Not enough tickets left }
+        status: { type: integer, example: 409 }
+        detail: { type: string, example: Only 1 Student ticket remains. }
+        instance: { type: string, format: uri-reference }
+        code: { $ref: '#/components/schemas/ErrorCode' }
+        errors:
+          type: array
+          description: Field-level errors for `validation_failed`.
+          items: { $ref: '#/components/schemas/FieldError' }
+        ticketTypeId:
+          type: string
+          description: Present for `sold_out`.
+        remaining:
+          type: integer
+          minimum: 0
+          description: Present for `sold_out`. Tickets still available for `ticketTypeId`.
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: JSON Pointer to the offending field.
+          example: /attendees/1/email
+        message: { type: string, example: Email is already used by another ticket in this order. }
+
+    # ------------------------------------------------------------ Shared values
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: integer
+          description: Integer minor units (e.g. cents).
+          example: 49900
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          example: USD
+    ConfirmationNumber:
+      type: string
+      description: 8 characters from an alphabet without ambiguous characters (no 0, O, 1, I). Unique per ticket.
+      pattern: '^[2-9A-HJ-NP-Z]{8}$'
+      example: K7QX4MPZ
+
+    # ------------------------------------------------------------ Public
+    Event:
+      type: object
+      required: [name, startsAt, endsAt, timezone, organizer, currency, maxTicketsPerOrder, questions, policies]
+      properties:
+        name: { type: string, example: DevConf 2027 }
+        description: { type: string }
+        startsAt: { type: string, format: date-time, example: '2027-04-14T14:00:00Z' }
+        endsAt: { type: string, format: date-time, example: '2027-04-15T22:00:00Z' }
+        timezone: { type: string, description: IANA timezone, example: America/Chicago }
+        venue:
+          type: [object, 'null']
+          required: [name, address]
+          properties:
+            name: { type: string, example: Austin Convention Center }
+            address: { type: string, example: '500 E Cesar Chavez St, Austin, TX' }
+        virtualUrl: { type: [string, 'null'], format: uri }
+        organizer:
+          type: object
+          required: [name, email]
+          properties:
+            name: { type: string }
+            email: { type: string, format: email }
+        bannerImageUrl: { type: [string, 'null'], format: uri-reference }
+        currency: { type: string, pattern: '^[A-Z]{3}$', example: USD }
+        maxTicketsPerOrder: { type: integer, example: 10 }
+        questions:
+          type: array
+          description: Returned as configured. Answers are not enforced or stored in v1.
+          items: { $ref: '#/components/schemas/Question' }
+        policies:
+          type: array
+          description: Returned as configured. Consent is not enforced or stored in v1.
+          items: { $ref: '#/components/schemas/Policy' }
+    Question:
+      type: object
+      required: [id, label, type, required]
+      properties:
+        id: { type: string, example: shirt }
+        label: { type: string, example: T-shirt size }
+        type:
+          type: string
+          enum: [text, select, checkbox]
+        required: { type: boolean }
+        options:
+          type: array
+          description: Present for `select` questions.
+          items: { type: string }
+          example: [XS, S, M, L, XL, XXL]
+    Policy:
+      type: object
+      required: [type, version, url]
+      properties:
+        type:
+          type: string
+          enum: [code_of_conduct, privacy]
+        version: { type: string, example: '2026-11-01' }
+        url: { type: string, format: uri }
+        text: { type: string }
+    TicketType:
+      type: object
+      required: [id, name, price, saleStartsAt, saleEndsAt, availability]
+      properties:
+        id: { type: string, example: general }
+        name: { type: string, example: General Admission }
+        description: { type: string }
+        price: { $ref: '#/components/schemas/Money' }
+        saleStartsAt: { type: string, format: date-time }
+        saleEndsAt: { type: string, format: date-time }
+        availability:
+          type: string
+          description: Only `available` and `sold_out` occur in v1. Sale windows are not enforced.
+          enum: [available, sold_out]
+
+    # ------------------------------------------------------------ Orders: request
+    BuyerInput:
+      type: object
+      required: [name, email]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        email: { type: string, format: email }
+    InvoiceDetails:
+      type: object
+      description: Accepted and ignored in v1. Not validated or stored.
+      properties:
+        companyName: { type: [string, 'null'] }
+        billingAddress: { type: [string, 'null'] }
+        poNumber: { type: [string, 'null'] }
+    AttendeeInput:
+      type: object
+      required: [ticketTypeId, firstName, lastName, email]
+      properties:
+        ticketTypeId:
+          type: string
+          description: Must be a configured ticket type id.
+        firstName: { type: string, minLength: 1, maxLength: 100 }
+        lastName: { type: string, minLength: 1, maxLength: 100 }
+        email:
+          type: string
+          format: email
+          description: Must be unique within the order. The same email may appear in different orders (FR-2.4).
+        answers:
+          type: object
+          description: Accepted and ignored in v1. Not validated or stored.
+          additionalProperties:
+            type: [string, boolean]
+        accommodationsRequested:
+          type: boolean
+          description: Accepted and ignored in v1. Not stored.
+    ConsentInput:
+      type: object
+      description: Accepted and ignored in v1. Not validated or stored.
+      properties:
+        type: { type: string }
+        version: { type: string }
+        accepted: { type: boolean }
+    CardInput:
+      type: object
+      writeOnly: true
+      description: |
+        Mock card. Only `number` is validated in v1. Never stored or logged except the
+        last four digits (FR-4.3).
+      required: [number]
+      properties:
+        cardholderName:
+          type: string
+          description: Accepted and ignored in v1.
+        number:
+          type: string
+          pattern: '^[0-9]{12,19}$'
+          description: Digits only; must pass the Luhn check. Ending in 0002 is declined.
+          example: '4242424242424242'
+        expMonth:
+          type: integer
+          description: Accepted and ignored in v1. Expiry freshness is not checked.
+        expYear:
+          type: integer
+          description: Accepted and ignored in v1. Expiry freshness is not checked.
+        cvc:
+          type: string
+          description: Accepted and ignored in v1. Format is not checked.
+    CreateOrderRequest:
+      type: object
+      required: [buyer, attendees]
+      description: |
+        The number of attendees per ticket type defines the quantities. The total number
+        of tickets must be between 1 and `Event.maxTicketsPerOrder`. Attendee emails must
+        be unique within the order. `payment` is required because every sample ticket
+        price is positive.
+      properties:
+        buyer: { $ref: '#/components/schemas/BuyerInput' }
+        invoiceDetails: { $ref: '#/components/schemas/InvoiceDetails' }
+        attendees:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/AttendeeInput' }
+        discountCode:
+          type: [string, 'null']
+          description: Accepted and ignored in v1. No price changes and no use is consumed.
+        consents:
+          type: array
+          description: Accepted and ignored in v1. May be omitted.
+          items: { $ref: '#/components/schemas/ConsentInput' }
+        payment: { $ref: '#/components/schemas/CardInput' }
+
+    # ------------------------------------------------------------ Orders: response
+    PaymentSummary:
+      type: object
+      required: [method, cardLast4, transactionId, amount, result, at]
+      properties:
+        method:
+          type: string
+          enum: [card]
+        cardLast4: { type: string, pattern: '^[0-9]{4}$' }
+        transactionId: { type: string, description: Mock transaction id. }
+        amount: { $ref: '#/components/schemas/Money' }
+        result:
+          type: string
+          enum: [approved]
+        at: { type: string, format: date-time }
+    Attendee:
+      type: object
+      description: |
+        In v1 `answers` is always empty and `accommodationsRequested` is always false,
+        whatever the request contained.
+      required: [id, confirmationNumber, ticketTypeId, ticketTypeName, firstName, lastName, email, answers, accommodationsRequested, status, pricePaid]
+      properties:
+        id: { type: string, format: uuid }
+        confirmationNumber: { $ref: '#/components/schemas/ConfirmationNumber' }
+        ticketTypeId: { type: string }
+        ticketTypeName: { type: string }
+        firstName: { type: string }
+        lastName: { type: string }
+        email: { type: string, format: email }
+        answers:
+          type: object
+          maxProperties: 0
+        accommodationsRequested: { const: false }
+        status:
+          type: string
+          enum: [confirmed]
+        pricePaid: { $ref: '#/components/schemas/Money' }
+        cancelledAt: { type: 'null' }
+    Order:
+      type: object
+      description: |
+        In v1 `invoiceDetails` is always empty, `discount` and `refunded` are always zero,
+        and `subtotal` equals `total`, whatever the request contained.
+      required: [id, orderNumber, status, buyer, invoiceDetails, subtotal, discount, total, refunded, payment, attendees, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        orderNumber: { type: string, example: ORD-000123 }
+        status:
+          type: string
+          enum: [paid]
+        buyer: { $ref: '#/components/schemas/BuyerInput' }
+        invoiceDetails:
+          type: object
+          maxProperties: 0
+        discountCode: { type: 'null' }
+        subtotal: { $ref: '#/components/schemas/Money' }
+        discount:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+            - properties: { amount: { const: 0 } }
+        total: { $ref: '#/components/schemas/Money' }
+        refunded:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+            - properties: { amount: { const: 0 } }
+        payment: { $ref: '#/components/schemas/PaymentSummary' }
+        attendees:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/Attendee' }
+        createdAt: { type: string, format: date-time }
+    OrderConfirmation:
+      type: object
+      required: [order, receiptUrl, invoiceUrl]
+      description: |
+        FR-5.2. `buyerAccessUrl` from `openapi.yaml` is omitted until magic links arrive in
+        v2 (spec section 11). `receiptUrl` and `invoiceUrl` are present, but the pages they
+        refer to are v3 operations; v1 does not serve them.
+      properties:
+        order: { $ref: '#/components/schemas/Order' }
+        receiptUrl: { type: string, format: uri-reference }
+        invoiceUrl: { type: string, format: uri-reference }
