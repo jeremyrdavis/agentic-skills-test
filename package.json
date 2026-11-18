@@ -1,0 +1,11 @@
+{
+  "name": "agentic-skills-test",
+  "private": true,
+  "description": "Newman runner for the Conference Registration API conformance suite",
+  "scripts": {
+    "test:v1": "newman run postman/conference-registration.postman_collection.json -e postman/local.postman_environment.json --folder \"v1 - Buy a ticket\""
+  },
+  "devDependencies": {
+    "newman": "^6.2.1"
+  }
+}
